@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/user"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -27,6 +28,7 @@ var (
 	errUnsupported  = errors.New("unsupported")
 	errNotFound     = errors.New("not found")
 	errUnauthorized = errors.New("unauthorized")
+	errAddrInUse    = errors.New("address in-use")
 
 	// ErrNoHostKeys indicates no host keys are found.
 	// It's returned by Server.DefaultConfig.
@@ -116,14 +118,24 @@ func LoadAuthorizedKeys(fn string) ([]ssh.PublicKey, error) {
 	return keys, nil
 }
 
-// ListenCallbackFunc receives callback when a listener is opened or closed.
-type ListenCallbackFunc func(ctx context.Context, host string, port int, on bool) error
+// ForwardingSetup is optional extension to perform extra work for setting up forwarding.
+type ForwardingSetup interface {
+	SetupForwarder(ctx context.Context, remoteAddr, localAddr string, on bool) error
+}
+
+// ForwardingSetupFunc is func form of ForwardingSetup.
+type ForwardingSetupFunc func(ctx context.Context, remoteAddr, localAddr string, on bool) error
+
+// SetupForwarder implements ForwardingSetup.
+func (f ForwardingSetupFunc) SetupForwarder(ctx context.Context, remoteAddr, localAddr string, on bool) error {
+	return f(ctx, remoteAddr, localAddr, on)
+}
 
 // Server implements the gateway using SSH.
 type Server struct {
-	Config         ssh.ServerConfig
-	BindAddress    string
-	ListenCallback ListenCallbackFunc
+	Config      ssh.ServerConfig
+	BindAddress string
+	Setup       ForwardingSetup
 }
 
 // NewServer creates Server.
@@ -217,9 +229,9 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	serverConn.run(ctx)
 }
 
-func (s *Server) listenCallback(ctx context.Context, host string, port int, on bool) error {
-	if callback := s.ListenCallback; callback != nil {
-		return callback(ctx, host, port, on)
+func (s *Server) setupForwarder(ctx context.Context, remoteAddr, localAddr string, on bool) error {
+	if setup := s.Setup; setup != nil {
+		return setup.SetupForwarder(ctx, remoteAddr, localAddr, on)
 	}
 	return nil
 }
@@ -227,6 +239,10 @@ func (s *Server) listenCallback(ctx context.Context, host string, port int, on b
 type forwardAddr struct {
 	BindAddr string
 	BindPort uint32
+}
+
+func (a forwardAddr) String() string {
+	return a.BindAddr + ":" + strconv.FormatUint(uint64(a.BindPort), 10)
 }
 
 type connection struct {
@@ -245,6 +261,10 @@ func (c *connection) log(format string, args ...interface{}) {
 	if glog.V(1) {
 		glog.InfoDepth(1, c.logPrefix+fmt.Sprintf(format, args...))
 	}
+}
+
+func (c *connection) localAddr(ln net.Listener) string {
+	return c.server.BindAddress + ":" + strconv.FormatUint(uint64(ln.Addr().(*net.TCPAddr).Port), 10)
 }
 
 func (c *connection) cleanup() {
@@ -301,14 +321,17 @@ func (c *connection) forwardStart(ctx context.Context, req *ssh.Request) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	c.log("REQ %s %s:%v bind-to %s", req.Type, faddr.BindAddr, faddr.BindPort, ln.Addr())
-	if err := c.server.listenCallback(ctx, faddr.BindAddr, ln.Addr().(*net.TCPAddr).Port, true); err != nil {
+
+	if !c.addListener(faddr, ln) {
 		ln.Close()
-		return nil, fmt.Errorf("callback error: %w", err)
+		return nil, errAddrInUse
 	}
 
-	if existing := c.addListener(ctx, faddr, ln); existing != nil {
-		existing.Close()
+	c.log("REQ %s %s bind-to %s", req.Type, faddr, ln.Addr())
+	if err := c.server.setupForwarder(ctx, faddr.String(), c.localAddr(ln), true); err != nil {
+		ln.Close()
+		c.removeListener(faddr, ln)
+		return nil, fmt.Errorf("setup error: %w", err)
 	}
 
 	go c.forwardRun(ctx, faddr, ln)
@@ -319,12 +342,13 @@ func (c *connection) forwardStart(ctx context.Context, req *ssh.Request) ([]byte
 }
 
 func (c *connection) forwardRun(ctx context.Context, faddr forwardAddr, ln net.Listener) {
-	logPrefix := fmt.Sprintf("FWD-CLOSE %s:%v bind-to %s ", faddr.BindAddr, faddr.BindPort, ln.Addr())
-	localPort := ln.Addr().(*net.TCPAddr).Port
+	logPrefix := fmt.Sprintf("FWD-CLOSE %s bind-to %s ", faddr, ln.Addr())
+	localAddr := c.localAddr(ln)
 	go closeWhenDone(ctx, ln)
 	defer func() {
-		if err := c.server.listenCallback(ctx, faddr.BindAddr, localPort, false); err != nil {
-			c.log("%s callback error: %v", logPrefix, err)
+		c.removeListener(faddr, ln)
+		if err := c.server.setupForwarder(ctx, faddr.String(), localAddr, false); err != nil {
+			c.log("%s teardown error: %v", logPrefix, err)
 		}
 		c.log("%s", logPrefix)
 		ln.Close()
@@ -353,11 +377,11 @@ func (c *connection) forwardConn(ctx context.Context, conn net.Conn, faddr forwa
 		OriginPort: uint32(originAddr.Port),
 	}))
 	if err != nil {
-		c.log("FWD %s:%v from %s error: %v", faddr.BindAddr, faddr.BindPort, conn.RemoteAddr(), err)
+		c.log("FWD %s from %s error: %v", faddr, conn.RemoteAddr(), err)
 		return
 	}
-	c.log("FWD %s:%v from %s START", faddr.BindAddr, faddr.BindPort, conn.RemoteAddr())
-	defer c.log("FWD %s:%v from %s END", faddr.BindAddr, faddr.BindPort, conn.RemoteAddr())
+	c.log("FWD %s from %s START", faddr, conn.RemoteAddr())
+	defer c.log("FWD %s from %s END", faddr, conn.RemoteAddr())
 	go ssh.DiscardRequests(reqsCh)
 	forward(ctx, chn, conn)
 }
@@ -367,32 +391,34 @@ func (c *connection) forwardCancel(ctx context.Context, req *ssh.Request) ([]byt
 	if err := ssh.Unmarshal(req.Payload, &faddr); err != nil {
 		return nil, err
 	}
-	c.log("REQ %s %s:%v", req.Type, faddr.BindAddr, faddr.BindPort)
-	if ln := c.removeListener(ctx, faddr); ln != nil {
+	c.log("REQ %s %s", req.Type, faddr)
+	if ln := c.removeListener(faddr, nil); ln != nil {
 		ln.Close()
 		return nil, nil
 	}
 	return nil, errNotFound
 }
 
-func (c *connection) addListener(ctx context.Context, faddr forwardAddr, ln net.Listener) net.Listener {
+func (c *connection) addListener(faddr forwardAddr, ln net.Listener) bool {
 	c.listenersLock.Lock()
 	defer c.listenersLock.Unlock()
 	if c.listeners == nil {
 		c.listeners = make(map[forwardAddr]net.Listener)
 	}
-	existing := c.listeners[faddr]
+	if _, ok := c.listeners[faddr]; ok {
+		return false
+	}
 	c.listeners[faddr] = ln
-	return existing
+	return true
 }
 
-func (c *connection) removeListener(ctx context.Context, faddr forwardAddr) net.Listener {
+func (c *connection) removeListener(faddr forwardAddr, ln net.Listener) net.Listener {
 	c.listenersLock.Lock()
 	defer c.listenersLock.Unlock()
-	ln, ok := c.listeners[faddr]
-	if ok {
+	existing, ok := c.listeners[faddr]
+	if ok && (ln == nil || ln == existing) {
 		delete(c.listeners, faddr)
-		return ln
+		return existing
 	}
 	return nil
 }

@@ -8,15 +8,15 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/evo-cloud/epd/pkg/endpoint"
-	"github.com/evo-cloud/epd/pkg/ssh"
+	"github.com/evo-cloud/spf/pkg/endpoint"
+	"github.com/evo-cloud/spf/pkg/ssh"
 	"github.com/golang/glog"
 )
 
 var (
 	listenAddr   = flag.String("addr", ":2022", "Listening address")
 	bindAddr     = flag.String("bind-addr", "localhost", "Bind address for remote forwarding ports")
-	endpointExec = flag.String("endpoint-exec", "", "Endpoint setup executable")
+	setupCmd     = flag.String("setup-cmd", "", "Endpoint setup executable")
 	hostKeyFiles = flag.String("host-key-files", "", "Comma-separated host key files")
 )
 
@@ -38,9 +38,8 @@ func main() {
 	}
 	server.BindAddress = *bindAddr
 
-	if *endpointExec != "" {
-		configurator := &endpoint.Exec{Program: *endpointExec}
-		server.ListenCallback = configurator.ListenCallback(server.BindAddress)
+	if *setupCmd != "" {
+		server.Setup = &endpoint.Exec{Program: *setupCmd}
 	}
 
 	sigCh := make(chan os.Signal, 1)
