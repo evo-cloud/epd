@@ -347,7 +347,8 @@ func (c *connection) forwardRun(ctx context.Context, faddr forwardAddr, ln net.L
 	go closeWhenDone(ctx, ln)
 	defer func() {
 		c.removeListener(faddr, ln)
-		if err := c.server.setupForwarder(ctx, faddr.String(), localAddr, false); err != nil {
+		// Use a different context as the current one may be already canceled.
+		if err := c.server.setupForwarder(context.Background(), faddr.String(), localAddr, false); err != nil {
 			c.log("%s teardown error: %v", logPrefix, err)
 		}
 		c.log("%s", logPrefix)
