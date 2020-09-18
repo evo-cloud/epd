@@ -8,7 +8,7 @@ With Secure Port Forwarder running on a public network,
 a server behind a firewall can be exposed to the public network using:
 
 ```shell
-ssh -N -R www.example.com:80:localhost:8080 user@spf.example.com
+ssh -N -R https/www.example.com:localhost:8080 user@spf.example.com
 ```
 
 Here assuming Secure Port Forwarder is running on `spf.example.com` on regular SSH port `22`,
@@ -22,7 +22,7 @@ User must provide an endpoint setup script for setting up `www.example.com:80` o
 
 ## Usage
 
-Launch `spf` without arguments to use default configurations:
+Launch `spfd` without arguments to use default configurations:
 
 - `-addr=:2022`: listen on `:2022` as SSH server address;
 - Use host keys from `/etc/ssh`;
@@ -36,17 +36,64 @@ for forwarding the request on a specific DNS to a localhost port.
 The `PROGRAM` is invoked as:
 
 ```
-PROGRAM open|close public-host:public-port local-host:local-port
+PROGRAM open|close tcp|sock ENDPOINT local-host:local-port
 ```
 
-- `open` is used to ask the script to start forwarding from `public-host:public-port` to `local-host:local-port`;
-- `close` is used to ask the script to stop forwarding from `public-host:public-port`.
+- `open` is used to ask the script to start forwarding from `ENDPOINT` to `local-host:local-port`;
+- `close` is used to ask the script to stop forwarding from `ENDPOINT`.
 
-According to `-bind-address=A.B.C.D` when launching `spf`, and the SSH client command line, e.g.
+`ENDPOINT` is defined for
+- `tcp`: `public-host:public-port`
+- `sock`: a unix socket path, it's recommended to be `scheme/DNS`, e.g. `https/example.com`. 
+
+According to `-bind-address=A.B.C.D` when launching `spfd`, and the SSH client command line, e.g.
 
 ```shell
-ssh -N -R www.example.com:80:localhost:8080 user@spf.example.com
+ssh -N -R https/www.example.com:localhost:8080 user@spf.example.com
 ```
 
-- `public-host:public-port` is `www.example.com:80`;
-- `local-host:local-port` is `A.B.C.D:port` where the `port` is a random port opened by `spf`.
+It will call the setup program as
+
+```
+PROGRAM open sock https/www.example.com A.B.C.D:port
+```
+
+## The Client
+
+`spfc` is a client to work with server-side `spfd` as an HTTP reverse proxy.
+It watches dynamic backend states and exposes/unexposes endpoints accordingly.
+The currently supported backend states providers are:
+
+- `files`: Watches a list of directories (not sub-directories) and loads backend configurations from text files;
+- `k8s`: Run `spfc` as a Kubernetes controller which watches `Service` resources with annotation `spf.evo-cloud/endpoint` and exposes the annotation value as the endpoint on the server side.
+
+### Files Provider
+
+The format of a file containing backend states is:
+
+```
+ID ENDPOINT BACKEND-URL
+```
+
+E.g.
+
+```
+a https/a.example.com http://localhost:8080
+```
+
+Empty lines and lines starting with `#` are ignored.
+All the lines from all discovered files are merged to create the final list of backend states.
+Use the following command line flags to enable this provider:
+
+- `--files-dirs`: a semi-colon separated list of directory paths to watch for files and this must be specified to enable this provider;
+- `--files-glob`: a pattern to filter file names. The default value is `*` (matching all files).
+
+### Kubernetes Provider
+
+Simply put `--k8s` on the command line to enable this provider.
+It watches `Service` resource with annotation `spf.evo-cloud/endpoint`.
+The value of the annotation is used as `ENDPOINT` on the server side.
+The format should be `SCHEME/DNS`. `SCHEME` can be `https` or `http`.
+
+The first `Port` in the `Service` will be used as backend server port.
+If no `Port` is present, default HTTP port `80` will be used.

@@ -21,7 +21,10 @@ import (
 const (
 	reqTypeTCPIPForward       = "tcpip-forward"
 	reqTypeCancelTCPIPForward = "cancel-tcpip-forward"
+	reqTypeUnixForward        = "streamlocal-forward@openssh.com"
+	reqTypeCancelUnixForward  = "cancel-streamlocal-forward@openssh.com"
 	chnForwardedTCPIP         = "forwarded-tcpip"
+	chnForwardedUnix          = "forwarded-streamlocal@openssh.com"
 )
 
 var (
@@ -118,17 +121,31 @@ func LoadAuthorizedKeys(fn string) ([]ssh.PublicKey, error) {
 	return keys, nil
 }
 
+// ForwardAddr provides the requested address from the client.
+type ForwardAddr struct {
+	BindAddr   string
+	BindPort   uint32
+	SocketPath string
+}
+
+func (a ForwardAddr) String() string {
+	if a.SocketPath != "" {
+		return a.SocketPath
+	}
+	return a.BindAddr + ":" + strconv.FormatUint(uint64(a.BindPort), 10)
+}
+
 // ForwardingSetup is optional extension to perform extra work for setting up forwarding.
 type ForwardingSetup interface {
-	SetupForwarder(ctx context.Context, remoteAddr, localAddr string, on bool) error
+	SetupForwarder(ctx context.Context, faddr ForwardAddr, localAddr string, on bool) error
 }
 
 // ForwardingSetupFunc is func form of ForwardingSetup.
-type ForwardingSetupFunc func(ctx context.Context, remoteAddr, localAddr string, on bool) error
+type ForwardingSetupFunc func(ctx context.Context, faddr ForwardAddr, localAddr string, on bool) error
 
 // SetupForwarder implements ForwardingSetup.
-func (f ForwardingSetupFunc) SetupForwarder(ctx context.Context, remoteAddr, localAddr string, on bool) error {
-	return f(ctx, remoteAddr, localAddr, on)
+func (f ForwardingSetupFunc) SetupForwarder(ctx context.Context, faddr ForwardAddr, localAddr string, on bool) error {
+	return f(ctx, faddr, localAddr, on)
 }
 
 // Server implements the gateway using SSH.
@@ -229,20 +246,11 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	serverConn.run(ctx)
 }
 
-func (s *Server) setupForwarder(ctx context.Context, remoteAddr, localAddr string, on bool) error {
+func (s *Server) setupForwarder(ctx context.Context, faddr ForwardAddr, localAddr string, on bool) error {
 	if setup := s.Setup; setup != nil {
-		return setup.SetupForwarder(ctx, remoteAddr, localAddr, on)
+		return setup.SetupForwarder(ctx, faddr, localAddr, on)
 	}
 	return nil
-}
-
-type forwardAddr struct {
-	BindAddr string
-	BindPort uint32
-}
-
-func (a forwardAddr) String() string {
-	return a.BindAddr + ":" + strconv.FormatUint(uint64(a.BindPort), 10)
 }
 
 type connection struct {
@@ -254,7 +262,7 @@ type connection struct {
 	logPrefix string
 
 	listenersLock sync.Mutex
-	listeners     map[forwardAddr]net.Listener
+	listeners     map[ForwardAddr]net.Listener
 }
 
 func (c *connection) log(format string, args ...interface{}) {
@@ -295,9 +303,13 @@ func (c *connection) run(ctx context.Context) {
 			var err error
 			switch req.Type {
 			case reqTypeTCPIPForward:
-				data, err = c.forwardStart(ctx, req)
+				data, err = c.forwardStartTCP(ctx, req)
 			case reqTypeCancelTCPIPForward:
-				data, err = c.forwardCancel(ctx, req)
+				data, err = c.forwardCancelTCP(ctx, req)
+			case reqTypeUnixForward:
+				data, err = c.forwardStartUnix(ctx, req)
+			case reqTypeCancelUnixForward:
+				data, err = c.forwardCancelUnix(ctx, req)
 			default:
 				err = errUnsupported
 			}
@@ -311,44 +323,93 @@ func (c *connection) run(ctx context.Context) {
 	}
 }
 
-func (c *connection) forwardStart(ctx context.Context, req *ssh.Request) ([]byte, error) {
-	var faddr forwardAddr
-	if err := ssh.Unmarshal(req.Payload, &faddr); err != nil {
+func (c *connection) forwardStartTCP(ctx context.Context, req *ssh.Request) ([]byte, error) {
+	var addr struct {
+		BindAddr string
+		BindPort uint32
+	}
+	if err := ssh.Unmarshal(req.Payload, &addr); err != nil {
 		return nil, err
 	}
 
+	if err := c.forwardStart(ctx, ForwardAddr{BindAddr: addr.BindAddr, BindPort: addr.BindPort}, req); err != nil {
+		return nil, err
+	}
+
+	return ssh.Marshal(&struct {
+		BindPort uint32
+	}{BindPort: addr.BindPort}), nil
+}
+
+func (c *connection) forwardStartUnix(ctx context.Context, req *ssh.Request) ([]byte, error) {
+	var addr struct {
+		SocketPath string
+	}
+	if err := ssh.Unmarshal(req.Payload, &addr); err != nil {
+		return nil, err
+	}
+
+	if err := c.forwardStart(ctx, ForwardAddr{SocketPath: addr.SocketPath}, req); err != nil {
+		return nil, err
+	}
+
+	return ssh.Marshal(&struct {
+		SocketPath string
+		Reserved0  string
+	}{SocketPath: addr.SocketPath}), nil
+}
+
+func (c *connection) forwardCancelTCP(ctx context.Context, req *ssh.Request) ([]byte, error) {
+	var addr struct {
+		BindAddr string
+		BindPort uint32
+	}
+	if err := ssh.Unmarshal(req.Payload, &addr); err != nil {
+		return nil, err
+	}
+	return nil, c.forwardCancel(ctx, ForwardAddr{BindAddr: addr.BindAddr, BindPort: addr.BindPort}, req)
+}
+
+func (c *connection) forwardCancelUnix(ctx context.Context, req *ssh.Request) ([]byte, error) {
+	var addr struct {
+		SocketPath string
+	}
+	if err := ssh.Unmarshal(req.Payload, &addr); err != nil {
+		return nil, err
+	}
+	return nil, c.forwardCancel(ctx, ForwardAddr{SocketPath: addr.SocketPath}, req)
+}
+
+func (c *connection) forwardStart(ctx context.Context, faddr ForwardAddr, req *ssh.Request) error {
 	ln, err := net.Listen("tcp4", c.server.BindAddress+":0")
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if !c.addListener(faddr, ln) {
 		ln.Close()
-		return nil, errAddrInUse
+		return errAddrInUse
 	}
 
 	c.log("REQ %s %s bind-to %s", req.Type, faddr, ln.Addr())
-	if err := c.server.setupForwarder(ctx, faddr.String(), c.localAddr(ln), true); err != nil {
+	if err := c.server.setupForwarder(ctx, faddr, c.localAddr(ln), true); err != nil {
 		ln.Close()
 		c.removeListener(faddr, ln)
-		return nil, fmt.Errorf("setup error: %w", err)
+		return fmt.Errorf("setup error: %w", err)
 	}
 
 	go c.forwardRun(ctx, faddr, ln)
-
-	return ssh.Marshal(&struct {
-		BindPort uint32
-	}{BindPort: faddr.BindPort}), nil
+	return nil
 }
 
-func (c *connection) forwardRun(ctx context.Context, faddr forwardAddr, ln net.Listener) {
+func (c *connection) forwardRun(ctx context.Context, faddr ForwardAddr, ln net.Listener) {
 	logPrefix := fmt.Sprintf("FWD-CLOSE %s bind-to %s ", faddr, ln.Addr())
 	localAddr := c.localAddr(ln)
 	go closeWhenDone(ctx, ln)
 	defer func() {
 		c.removeListener(faddr, ln)
 		// Use a different context as the current one may be already canceled.
-		if err := c.server.setupForwarder(context.Background(), faddr.String(), localAddr, false); err != nil {
+		if err := c.server.setupForwarder(context.Background(), faddr, localAddr, false); err != nil {
 			c.log("%s teardown error: %v", logPrefix, err)
 		}
 		c.log("%s", logPrefix)
@@ -363,20 +424,32 @@ func (c *connection) forwardRun(ctx context.Context, faddr forwardAddr, ln net.L
 	}
 }
 
-func (c *connection) forwardConn(ctx context.Context, conn net.Conn, faddr forwardAddr) {
+func (c *connection) forwardConn(ctx context.Context, conn net.Conn, faddr ForwardAddr) {
 	defer conn.Close()
 	originAddr := conn.RemoteAddr().(*net.TCPAddr)
-	chn, reqsCh, err := c.conn.OpenChannel(chnForwardedTCPIP, ssh.Marshal(&struct {
-		DestAddr   string
-		DestPort   uint32
-		OriginAddr string
-		OriginPort uint32
-	}{
-		DestAddr:   faddr.BindAddr,
-		DestPort:   faddr.BindPort,
-		OriginAddr: originAddr.IP.String(),
-		OriginPort: uint32(originAddr.Port),
-	}))
+	var name string
+	var msg []byte
+	if faddr.SocketPath != "" {
+		name = chnForwardedUnix
+		msg = ssh.Marshal(&struct {
+			SocketPath string
+			Reserved0  string
+		}{SocketPath: faddr.SocketPath})
+	} else {
+		name = chnForwardedTCPIP
+		msg = ssh.Marshal(&struct {
+			DestAddr   string
+			DestPort   uint32
+			OriginAddr string
+			OriginPort uint32
+		}{
+			DestAddr:   faddr.BindAddr,
+			DestPort:   faddr.BindPort,
+			OriginAddr: originAddr.IP.String(),
+			OriginPort: uint32(originAddr.Port),
+		})
+	}
+	chn, reqsCh, err := c.conn.OpenChannel(name, msg)
 	if err != nil {
 		c.log("FWD %s from %s error: %v", faddr, conn.RemoteAddr(), err)
 		return
@@ -387,24 +460,20 @@ func (c *connection) forwardConn(ctx context.Context, conn net.Conn, faddr forwa
 	forward(ctx, chn, conn)
 }
 
-func (c *connection) forwardCancel(ctx context.Context, req *ssh.Request) ([]byte, error) {
-	var faddr forwardAddr
-	if err := ssh.Unmarshal(req.Payload, &faddr); err != nil {
-		return nil, err
-	}
+func (c *connection) forwardCancel(ctx context.Context, faddr ForwardAddr, req *ssh.Request) error {
 	c.log("REQ %s %s", req.Type, faddr)
 	if ln := c.removeListener(faddr, nil); ln != nil {
 		ln.Close()
-		return nil, nil
+		return nil
 	}
-	return nil, errNotFound
+	return errNotFound
 }
 
-func (c *connection) addListener(faddr forwardAddr, ln net.Listener) bool {
+func (c *connection) addListener(faddr ForwardAddr, ln net.Listener) bool {
 	c.listenersLock.Lock()
 	defer c.listenersLock.Unlock()
 	if c.listeners == nil {
-		c.listeners = make(map[forwardAddr]net.Listener)
+		c.listeners = make(map[ForwardAddr]net.Listener)
 	}
 	if _, ok := c.listeners[faddr]; ok {
 		return false
@@ -413,7 +482,7 @@ func (c *connection) addListener(faddr forwardAddr, ln net.Listener) bool {
 	return true
 }
 
-func (c *connection) removeListener(faddr forwardAddr, ln net.Listener) net.Listener {
+func (c *connection) removeListener(faddr ForwardAddr, ln net.Listener) net.Listener {
 	c.listenersLock.Lock()
 	defer c.listenersLock.Unlock()
 	existing, ok := c.listeners[faddr]
